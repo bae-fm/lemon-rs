@@ -1,6 +1,7 @@
 //! Adaptation/port of [Go scanner](http://tip.golang.org/pkg/bufio/#Scanner).
 
-use log::debug;
+use log::Level::Debug;
+use log::{debug, log_enabled};
 
 use std::error::Error;
 use std::fmt;
@@ -17,6 +18,8 @@ pub struct Pos {
 
 impl Pos {
     pub fn from(input: &[u8], offset: usize) -> Self {
+        #[cfg(test)]
+        test::POSITIONS_BUILT.set(test::POSITIONS_BUILT.get() + 1);
         let (mut line, mut column) = (1, 1);
         for byte in &input[..offset] {
             if *byte == b'\n' {
@@ -130,7 +133,12 @@ impl<S: Splitter> Scanner<S> {
         &mut self,
         input: &'input [u8],
     ) -> ScanResult<'input, S::TokenType, S::Error> {
-        debug!(target: "scanner", "scan({})", Pos::from(input, self.offset));
+        // `Pos::from` walks the input from its start, so building it for every
+        // token makes a scan quadratic in the input's length. Build it only
+        // when this line is kept.
+        if log_enabled!(target: "scanner", Debug) {
+            debug!(target: "scanner", "scan({})", Pos::from(input, self.offset));
+        }
         // Loop until we have a token.
         loop {
             // See if we can get a token with what we already have.
@@ -177,5 +185,67 @@ impl<S: Splitter> fmt::Debug for Scanner<S> {
             .field("offset", &self.offset)
             .field("mark", &self.mark)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::cell::Cell;
+
+    use log::{LevelFilter, Log, Metadata, Record};
+
+    use super::Scanner;
+    use crate::lexer::sql::Tokenizer;
+
+    thread_local! {
+        /// Number of `Pos::from` calls made on this thread
+        pub(super) static POSITIONS_BUILT: Cell<usize> = const { Cell::new(0) };
+        /// Whether `LOGGER` keeps the `scanner` lines logged on this thread
+        static KEEP_SCANNER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Keeps every debug line except the `scanner` ones, unless the current
+    /// thread asks for those too.
+    struct Logger;
+
+    impl Log for Logger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() != "scanner" || KEEP_SCANNER.get()
+        }
+
+        fn log(&self, _: &Record<'_>) {}
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: Logger = Logger;
+
+    /// `Pos::from` walks the input from its start, so building a position for
+    /// every token would make a scan quadratic in the input's length.
+    #[test]
+    fn position_built_only_when_scanner_debug_is_kept() {
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(LevelFilter::Debug);
+        let input = "SELECT a, b FROM t WHERE c = 1;\n".repeat(1_000);
+
+        KEEP_SCANNER.set(false);
+        POSITIONS_BUILT.set(0);
+        scan_all(input.as_bytes());
+        assert_eq!(POSITIONS_BUILT.get(), 0);
+
+        KEEP_SCANNER.set(true);
+        POSITIONS_BUILT.set(0);
+        let scans = scan_all(input.as_bytes());
+        assert_eq!(POSITIONS_BUILT.get(), scans);
+    }
+
+    /// Scans `input` to its end and returns the number of `scan` calls.
+    fn scan_all(input: &[u8]) -> usize {
+        let mut s = Scanner::new(Tokenizer::new());
+        let mut scans = 1;
+        while s.scan(input).unwrap().1.is_some() {
+            scans += 1;
+        }
+        scans
     }
 }
